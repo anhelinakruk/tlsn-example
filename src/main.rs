@@ -12,12 +12,16 @@ use smol_hyper::rt::FuturesIo;
 use smol_macros::main;
 use tls_core::verify::WebPkiVerifier;
 use tlsn_common::config::{ProtocolConfig, ProtocolConfigValidator};
-use tlsn_core::CryptoProvider;
-use tlsn_prover::{Prover, ProverConfig};
+use tlsn_core::{CryptoProvider, transcript::Idx};
+use tlsn_prover::{Prover, ProverConfig, state::Prove};
 use tlsn_verifier::{SessionInfo, Verifier, VerifierConfig};
 
 const SECRET: &str = "TLSNotary's private key 🤡";
 const SERVER_DOMAIN: &str = "test-server.io";
+
+const MAX_SENT_DATA: usize = 1 << 12;
+const MAX_RECV_DATA: usize = 1 << 14;
+
 #[apply(main!)]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -64,7 +68,7 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut root_store = tls_core::anchors::RootCertStore::empty();
     root_store
         .add(&tls_core::key::Certificate(
-            include_bytes!("../certs/rootCA.der").to_vec(),
+            include_bytes!("../certs/root_ca_cert.der").to_vec(),
         ))
         .unwrap();
     let crypto_provider = CryptoProvider {
@@ -77,8 +81,8 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             .server_name(server_domain)
             .protocol_config(
                 ProtocolConfig::builder()
-                    .max_sent_data(1024)
-                    .max_recv_data(1024)
+                    .max_sent_data(MAX_SENT_DATA)
+                    .max_recv_data(MAX_RECV_DATA)
                     .build()
                     .unwrap(),
             )
@@ -109,7 +113,7 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             .unwrap();
 
     // Spawn the connection to run in the background.
-    smol::spawn(connection);
+    let _ = smol::spawn(connection);
 
     let request = Request::builder()
         .uri(uri.clone())
@@ -123,7 +127,11 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     assert!(response.status() == StatusCode::OK);
 
-    let prover = prover_task.await.unwrap().start_prove();
+    let mut prover = prover_task.await.unwrap().start_prove();
+    // Reveal parts of the transcript.
+    let idx_sent = revealed_ranges_sent(&mut prover);
+    let idx_recv = revealed_ranges_received(&mut prover);
+    prover.prove_transcript(idx_sent, idx_recv).await.unwrap();
 
     prover.finalize().await.unwrap();
 }
@@ -132,15 +140,15 @@ async fn verifier<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     socket: T,
 ) -> (Vec<u8>, Vec<u8>, SessionInfo) {
     let config_validator = ProtocolConfigValidator::builder()
-        .max_sent_data(1024)
-        .max_recv_data(1024)
+        .max_sent_data(MAX_SENT_DATA)
+        .max_recv_data(MAX_RECV_DATA)
         .build()
         .unwrap();
 
     let mut root_store = tls_core::anchors::RootCertStore::empty();
     root_store
         .add(&tls_core::key::Certificate(
-            include_bytes!("../certs/rootCA.der").to_vec(),
+            include_bytes!("../certs/root_ca_cert.der").to_vec(),
         ))
         .unwrap();
     let crypto_provider = CryptoProvider {
@@ -167,7 +175,7 @@ async fn verifier<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let received = partial_transcript.received_unsafe().to_vec();
     let response = String::from_utf8(received.clone()).expect("Verifier expected received data");
     response
-        .find(SERVER_DOMAIN)
+        .find("Herman Melville")
         .unwrap_or_else(|| panic!("Expected valid data from {}", SERVER_DOMAIN));
     assert_eq!(session_info.server_name.as_str(), SERVER_DOMAIN);
 
@@ -178,4 +186,36 @@ fn bytes_to_redacted_string(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec())
         .unwrap()
         .replace('\0', "🙈")
+}
+
+/// Returns the received ranges to be revealed to the verifier.
+fn revealed_ranges_received(prover: &mut Prover<Prove>) -> Idx {
+    let recv_transcript = prover.transcript().received();
+    let recv_transcript_len = recv_transcript.len();
+
+    // Get the received data as a string.
+    let received_string = String::from_utf8(recv_transcript.to_vec()).unwrap();
+    // Find the substring "illustrative".
+    let start = received_string
+        .find("Dick")
+        .expect("Error: The substring 'Dick' was not found in the received data.");
+    let end = start + "Dick".len();
+
+    Idx::new([0..start, end..recv_transcript_len])
+}
+
+/// Returns the sent ranges to be revealed to the verifier.
+fn revealed_ranges_sent(prover: &mut Prover<Prove>) -> Idx {
+    let sent_transcript = prover.transcript().sent();
+    let sent_transcript_len = sent_transcript.len();
+
+    let sent_string = String::from_utf8(sent_transcript.to_vec()).unwrap();
+
+    let secret_start = sent_string.find(SECRET).unwrap();
+
+    // Reveal everything except for the SECRET.
+    Idx::new([
+        0..secret_start,
+        secret_start + SECRET.len()..sent_transcript_len,
+    ])
 }
