@@ -5,53 +5,39 @@ use hyper::{Request, StatusCode, Uri, body::Bytes};
 use macro_rules_attribute::apply;
 use smol::{
     io::{AsyncRead, AsyncWrite},
-    net::{TcpListener, TcpStream},
-    spawn,
+    net::TcpStream,
 };
 use smol_hyper::rt::FuturesIo;
 use smol_macros::main;
 use tls_core::verify::WebPkiVerifier;
-use tlsn_common::config::{ProtocolConfig, ProtocolConfigValidator};
+use tlsn_common::config::ProtocolConfig;
 use tlsn_core::{CryptoProvider, transcript::Idx};
 use tlsn_prover::{Prover, ProverConfig, state::Prove};
-use tlsn_verifier::{SessionInfo, Verifier, VerifierConfig};
-
-const SECRET: &str = "TLSNotary's private key 🤡";
-const SERVER_DOMAIN: &str = "test-server.io";
+use tracing::Level;
 
 const MAX_SENT_DATA: usize = 1 << 12;
 const MAX_RECV_DATA: usize = 1 << 14;
 
+const SECRET: &str = "TLSNotary's private key 🤡";
+const SERVER_DOMAIN: &str = "test-server.io";
+const SERVER_PORT: u16 = 4000;
+
+const SERVER_ADDR: &str = "127.0.0.1";
+const VERIFIER_ADDR: &str = "127.0.0.1:8079";
+
 #[apply(main!)]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt::fmt()
+        .with_max_level(Level::DEBUG)
+        .init();
 
-    let server_port: u16 = 4000;
+    let uri = format!("https://{}:{}/formats/html", SERVER_DOMAIN, SERVER_PORT);
+    let server_ip: IpAddr = SERVER_ADDR.parse().expect("Invalid IP address");
+    let server_addr = SocketAddr::new(server_ip, SERVER_PORT);
 
-    let uri = format!("https://{}:{}/formats/html", SERVER_DOMAIN, server_port);
-    let server_ip: IpAddr = "127.0.0.1".parse().expect("Invalid IP address");
-    let server_addr = SocketAddr::new(server_ip, server_port);
+    let verifier_socket = TcpStream::connect(VERIFIER_ADDR).await.unwrap();
 
-    let listener = TcpListener::bind("127.0.0.1:8079").await.unwrap();
-    let verifier_addr = listener.local_addr().unwrap();
-
-    let verifier_task = spawn(async move {
-        let (verifier_stream, _) = listener.accept().await.unwrap();
-        verifier(verifier_stream).await
-    });
-
-    let prover_socket = TcpStream::connect(verifier_addr).await.unwrap();
-    let prover_task = prover(prover_socket, &server_addr, &uri);
-
-    let ((), (sent, received, _session_info)): ((), (Vec<u8>, Vec<u8>, SessionInfo)) =
-        smol::future::zip(prover_task, verifier_task).await;
-
-    println!("Successfully verified {}", &uri);
-    println!("Verified sent data:\n{}", bytes_to_redacted_string(&sent));
-    println!(
-        "Verified received data:\n{}",
-        bytes_to_redacted_string(&received)
-    );
+    prover(verifier_socket, &server_addr, &uri).await;
 }
 
 async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
@@ -68,7 +54,7 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut root_store = tls_core::anchors::RootCertStore::empty();
     root_store
         .add(&tls_core::key::Certificate(
-            include_bytes!("../certs/root_ca_cert.der").to_vec(),
+            include_bytes!("../../certs/root_ca_cert.der").to_vec(),
         ))
         .unwrap();
     let crypto_provider = CryptoProvider {
@@ -134,58 +120,6 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     prover.prove_transcript(idx_sent, idx_recv).await.unwrap();
 
     prover.finalize().await.unwrap();
-}
-
-async fn verifier<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
-    socket: T,
-) -> (Vec<u8>, Vec<u8>, SessionInfo) {
-    let config_validator = ProtocolConfigValidator::builder()
-        .max_sent_data(MAX_SENT_DATA)
-        .max_recv_data(MAX_RECV_DATA)
-        .build()
-        .unwrap();
-
-    let mut root_store = tls_core::anchors::RootCertStore::empty();
-    root_store
-        .add(&tls_core::key::Certificate(
-            include_bytes!("../certs/root_ca_cert.der").to_vec(),
-        ))
-        .unwrap();
-    let crypto_provider = CryptoProvider {
-        cert: WebPkiVerifier::new(root_store, None),
-        ..Default::default()
-    };
-
-    let verifier_config = VerifierConfig::builder()
-        .protocol_config_validator(config_validator)
-        .crypto_provider(crypto_provider)
-        .build()
-        .unwrap();
-    let verifier = Verifier::new(verifier_config);
-
-    let (mut partial_transcript, session_info) = verifier.verify(socket).await.unwrap();
-    partial_transcript.set_unauthed(0);
-
-    let sent = partial_transcript.sent_unsafe().to_vec();
-    let sent_data = String::from_utf8(sent.clone()).expect("Verifier expected sent data");
-    sent_data
-        .find(SERVER_DOMAIN)
-        .unwrap_or_else(|| panic!("Verification failed: Expected host {}", SERVER_DOMAIN));
-
-    let received = partial_transcript.received_unsafe().to_vec();
-    let response = String::from_utf8(received.clone()).expect("Verifier expected received data");
-    response
-        .find("Herman Melville")
-        .unwrap_or_else(|| panic!("Expected valid data from {}", SERVER_DOMAIN));
-    assert_eq!(session_info.server_name.as_str(), SERVER_DOMAIN);
-
-    (sent, received, session_info)
-}
-
-fn bytes_to_redacted_string(bytes: &[u8]) -> String {
-    String::from_utf8(bytes.to_vec())
-        .unwrap()
-        .replace('\0', "🙈")
 }
 
 /// Returns the received ranges to be revealed to the verifier.
