@@ -4,6 +4,7 @@ use http_body_util::Empty;
 use hyper::{Request, StatusCode, Uri, body::Bytes};
 use macro_rules_attribute::apply;
 use smol::{
+    Task,
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
 };
@@ -19,8 +20,8 @@ const MAX_SENT_DATA: usize = 1 << 12;
 const MAX_RECV_DATA: usize = 1 << 14;
 
 const SECRET: &str = "TLSNotary's private key 🤡";
-const SERVER_DOMAIN: &str = "test-server.io";
-const SERVER_PORT: u16 = 4000;
+const SERVER_DOMAIN: &str = "localhost";
+const SERVER_PORT: u16 = 3001;
 
 const SERVER_ADDR: &str = "127.0.0.1";
 const VERIFIER_ADDR: &str = "127.0.0.1:8079";
@@ -55,7 +56,7 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut root_store = tls_core::anchors::RootCertStore::empty();
     root_store
         .add(&tls_core::key::Certificate(
-            include_bytes!("../../certs/root_ca_cert.der").to_vec(),
+            include_bytes!("../../certs/rootCA.der").to_vec(),
         ))
         .unwrap();
     let crypto_provider = CryptoProvider {
@@ -105,7 +106,9 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     println!("Handshake completed");
 
     // Spawn the connection to run in the background.
-    let _ = smol::spawn(connection);
+    let task = smol::spawn(connection);
+    Task::detach(task);
+    println!("Detached the connection");
     println!("Spawned the connection to run in the background");
 
     let request = Request::builder()

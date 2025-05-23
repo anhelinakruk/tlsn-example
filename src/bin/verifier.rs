@@ -11,7 +11,7 @@ use tlsn_core::CryptoProvider;
 use tlsn_verifier::{SessionInfo, Verifier, VerifierConfig};
 use tracing::Level;
 
-const SERVER_DOMAIN: &str = "test-server.io";
+const SERVER_DOMAIN: &str = "localhost";
 const MAX_SENT_DATA: usize = 1 << 12;
 const MAX_RECV_DATA: usize = 1 << 14;
 
@@ -49,7 +49,7 @@ async fn verifier<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut root_store = tls_core::anchors::RootCertStore::empty();
     root_store
         .add(&tls_core::key::Certificate(
-            include_bytes!("../../certs/root_ca_cert.der").to_vec(),
+            include_bytes!("../../certs/rootCA.der").to_vec(),
         ))
         .unwrap();
     let crypto_provider = CryptoProvider {
