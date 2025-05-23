@@ -9,11 +9,10 @@ tlsn-core = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.10"
 tlsn-prover = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.10", version = "0.1.0-alpha.10" }
 tlsn-verifier = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.10", version = "0.1.0-alpha.10" }
 tls-core = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.10", version = "0.1.0-alpha.10", package = "tlsn-tls-core" }
-smol = "2.0.2"
-smol-hyper = "0.1.1"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 hyper = { version = "1.6.0", features = ["full"] }
+hyper-util = { version = "0.1.12", features = ["full"] }
 http-body-util = "0.1"
-smol-macros = "0.1.1"
-macro_rules_attribute = "0.2.0"
+tokio = { version = "1.45.0", features = ["full"] }
+tokio-util = { version = "0.7.15", features = ["full"] }

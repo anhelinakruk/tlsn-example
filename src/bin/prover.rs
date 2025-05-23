@@ -2,36 +2,39 @@ use std::net::{IpAddr, SocketAddr};
 
 use http_body_util::Empty;
 use hyper::{Request, StatusCode, Uri, body::Bytes};
-use macro_rules_attribute::apply;
-use smol::{
-    io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
-};
-use smol_hyper::rt::FuturesIo;
-use smol_macros::main;
+
+use hyper_util::rt::TokioIo;
 use tls_core::verify::WebPkiVerifier;
 use tlsn_common::config::ProtocolConfig;
 use tlsn_core::{CryptoProvider, transcript::Idx};
 use tlsn_prover::{Prover, ProverConfig, state::Prove};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+};
+use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tracing::Level;
 
 const MAX_SENT_DATA: usize = 1 << 12;
 const MAX_RECV_DATA: usize = 1 << 14;
 
 const SECRET: &str = "TLSNotary's private key 🤡";
-const SERVER_DOMAIN: &str = "test-server.io";
-const SERVER_PORT: u16 = 4000;
+const SERVER_DOMAIN: &str = "localhost";
+const SERVER_PORT: u16 = 3001;
 
 const SERVER_ADDR: &str = "127.0.0.1";
 const VERIFIER_ADDR: &str = "127.0.0.1:8079";
 
-#[apply(main!)]
+#[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::fmt()
         .with_max_level(Level::DEBUG)
         .init();
 
-    let uri = format!("https://{}:{}/formats/html", SERVER_DOMAIN, SERVER_PORT);
+    let uri = format!(
+        "https://{}:{}/retail/transaction/6",
+        SERVER_DOMAIN, SERVER_PORT
+    );
     let server_ip: IpAddr = SERVER_ADDR.parse().expect("Invalid IP address");
     let server_addr = SocketAddr::new(server_ip, SERVER_PORT);
 
@@ -55,7 +58,7 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut root_store = tls_core::anchors::RootCertStore::empty();
     root_store
         .add(&tls_core::key::Certificate(
-            include_bytes!("../../certs/root_ca_cert.der").to_vec(),
+            include_bytes!("../../certs/rootCA.der").to_vec(),
         ))
         .unwrap();
     let crypto_provider = CryptoProvider {
@@ -77,7 +80,7 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             .build()
             .unwrap(),
     )
-    .setup(verifier_socket)
+    .setup(verifier_socket.compat())
     .await
     .unwrap();
 
@@ -86,15 +89,16 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     println!("Connected to TLS Server");
 
     // Pass server connection into the prover.
-    let (mpc_tls_connection, prover_fut) = prover.connect(tls_client_socket).await.unwrap();
+    let (mpc_tls_connection, prover_fut) =
+        prover.connect(tls_client_socket.compat()).await.unwrap();
     println!("Connected to Verifier");
 
     // Wrap the connection in a TokioIo compatibility layer to use it with hyper.
-    let mpc_tls_connection = FuturesIo::new(mpc_tls_connection);
+    let mpc_tls_connection = TokioIo::new(mpc_tls_connection.compat());
     println!("Wrapped connection in FuturesIo compatibility layer");
 
     // Spawn the Prover to run in the background.
-    let prover_task = smol::spawn(prover_fut);
+    let prover_task = tokio::spawn(prover_fut);
     println!("Spawned the Prover to run in the background");
 
     // MPC-TLS Handshake.
@@ -105,7 +109,7 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     println!("Handshake completed");
 
     // Spawn the connection to run in the background.
-    let _ = smol::spawn(connection);
+    tokio::spawn(connection);
     println!("Spawned the connection to run in the background");
 
     let request = Request::builder()
@@ -123,7 +127,7 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     assert!(response.status() == StatusCode::OK);
     println!("Response received");
 
-    let mut prover = prover_task.await.unwrap().start_prove();
+    let mut prover = prover_task.await.unwrap().unwrap().start_prove();
     println!("Started the Prover");
     // Reveal parts of the transcript.
     let idx_sent = revealed_ranges_sent(&mut prover);
@@ -141,15 +145,7 @@ fn revealed_ranges_received(prover: &mut Prover<Prove>) -> Idx {
     let recv_transcript = prover.transcript().received();
     let recv_transcript_len = recv_transcript.len();
 
-    // Get the received data as a string.
-    let received_string = String::from_utf8(recv_transcript.to_vec()).unwrap();
-    // Find the substring "illustrative".
-    let start = received_string
-        .find("Dick")
-        .expect("Error: The substring 'Dick' was not found in the received data.");
-    let end = start + "Dick".len();
-
-    Idx::new([0..start, end..recv_transcript_len])
+    Idx::new([0..recv_transcript_len])
 }
 
 /// Returns the sent ranges to be revealed to the verifier.
@@ -157,13 +153,6 @@ fn revealed_ranges_sent(prover: &mut Prover<Prove>) -> Idx {
     let sent_transcript = prover.transcript().sent();
     let sent_transcript_len = sent_transcript.len();
 
-    let sent_string = String::from_utf8(sent_transcript.to_vec()).unwrap();
-
-    let secret_start = sent_string.find(SECRET).unwrap();
-
     // Reveal everything except for the SECRET.
-    Idx::new([
-        0..secret_start,
-        secret_start + SECRET.len()..sent_transcript_len,
-    ])
+    Idx::new([0..sent_transcript_len])
 }

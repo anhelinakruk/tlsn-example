@@ -1,21 +1,20 @@
-use macro_rules_attribute::apply;
-use smol::{
-    io::{AsyncRead, AsyncWrite},
-    net::TcpListener,
-    spawn,
-};
-use smol_macros::main;
 use tls_core::verify::WebPkiVerifier;
 use tlsn_common::config::ProtocolConfigValidator;
 use tlsn_core::CryptoProvider;
 use tlsn_verifier::{SessionInfo, Verifier, VerifierConfig};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpListener,
+    spawn,
+};
+use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::Level;
 
-const SERVER_DOMAIN: &str = "test-server.io";
+const SERVER_DOMAIN: &str = "localhost";
 const MAX_SENT_DATA: usize = 1 << 12;
 const MAX_RECV_DATA: usize = 1 << 14;
 
-#[apply(main!)]
+#[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::fmt()
         .with_max_level(Level::DEBUG)
@@ -33,7 +32,11 @@ async fn main() {
             tracing::info!("session_info: {:?}", session_info);
         });
 
-        verifier_task.await;
+        let ok = verifier_task.await;
+        if let Err(e) = ok {
+            tracing::error!("Verifier task failed: {:?}", e);
+        }
+        tracing::info!("Verifier task completed");
     }
 }
 
@@ -49,7 +52,7 @@ async fn verifier<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut root_store = tls_core::anchors::RootCertStore::empty();
     root_store
         .add(&tls_core::key::Certificate(
-            include_bytes!("../../certs/root_ca_cert.der").to_vec(),
+            include_bytes!("../../certs/rootCA.der").to_vec(),
         ))
         .unwrap();
     let crypto_provider = CryptoProvider {
@@ -64,7 +67,7 @@ async fn verifier<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         .unwrap();
     let verifier = Verifier::new(verifier_config);
 
-    let (mut partial_transcript, session_info) = verifier.verify(socket).await.unwrap();
+    let (mut partial_transcript, session_info) = verifier.verify(socket.compat()).await.unwrap();
     partial_transcript.set_unauthed(0);
 
     let sent = partial_transcript.sent_unsafe().to_vec();
@@ -74,11 +77,6 @@ async fn verifier<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         .unwrap_or_else(|| panic!("Verification failed: Expected host {}", SERVER_DOMAIN));
 
     let received = partial_transcript.received_unsafe().to_vec();
-    let response = String::from_utf8(received.clone()).expect("Verifier expected received data");
-    response
-        .find("Herman Melville")
-        .unwrap_or_else(|| panic!("Expected valid data from {}", SERVER_DOMAIN));
-    assert_eq!(session_info.server_name.as_str(), SERVER_DOMAIN);
 
     (sent, received, session_info)
 }
