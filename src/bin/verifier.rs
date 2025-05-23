@@ -1,3 +1,4 @@
+use clap::Parser;
 use macro_rules_attribute::apply;
 use smol::{
     io::{AsyncRead, AsyncWrite},
@@ -8,26 +9,27 @@ use smol_macros::main;
 use tls_core::verify::WebPkiVerifier;
 use tlsn_common::config::ProtocolConfigValidator;
 use tlsn_core::CryptoProvider;
+use tlsn_example::{AppState, args::Args};
 use tlsn_verifier::{SessionInfo, Verifier, VerifierConfig};
 use tracing::Level;
 
-const SERVER_DOMAIN: &str = "localhost";
-const MAX_SENT_DATA: usize = 1 << 12;
-const MAX_RECV_DATA: usize = 1 << 14;
-
 #[apply(main!)]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::fmt()
         .with_max_level(Level::DEBUG)
         .init();
 
+    let args = Args::parse();
+    let app_state = AppState::new(&args)?;
+
     tracing::info!("starting...");
-    let listener = TcpListener::bind("127.0.0.1:8079").await.unwrap();
+    let listener = TcpListener::bind(app_state.clone().verifier_addr).await?;
 
     loop {
         let (socket, _) = listener.accept().await.unwrap();
+        let app_state = app_state.clone();
         let verifier_task = spawn(async move {
-            let (sent, received, session_info) = verifier(socket).await;
+            let (sent, received, session_info) = verifier(socket, &app_state).await;
             tracing::info!("sent: {:?}", sent);
             tracing::info!("received: {:?}", received);
             tracing::info!("session_info: {:?}", session_info);
@@ -39,17 +41,18 @@ async fn main() {
 
 async fn verifier<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     socket: T,
+    app_state: &AppState,
 ) -> (Vec<u8>, Vec<u8>, SessionInfo) {
     let config_validator = ProtocolConfigValidator::builder()
-        .max_sent_data(MAX_SENT_DATA)
-        .max_recv_data(MAX_RECV_DATA)
+        .max_sent_data(app_state.max_sent_data)
+        .max_recv_data(app_state.max_recv_data)
         .build()
         .unwrap();
 
     let mut root_store = tls_core::anchors::RootCertStore::empty();
     root_store
         .add(&tls_core::key::Certificate(
-            include_bytes!("../../certs/rootCA.der").to_vec(),
+            include_bytes!("../certs/rootCA.der").to_vec(),
         ))
         .unwrap();
     let crypto_provider = CryptoProvider {
@@ -70,15 +73,15 @@ async fn verifier<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let sent = partial_transcript.sent_unsafe().to_vec();
     let sent_data = String::from_utf8(sent.clone()).expect("Verifier expected sent data");
     sent_data
-        .find(SERVER_DOMAIN)
-        .unwrap_or_else(|| panic!("Verification failed: Expected host {}", SERVER_DOMAIN));
+        .find(app_state.server_domain.as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "Verification failed: Expected host {}",
+                app_state.server_domain
+            )
+        });
 
     let received = partial_transcript.received_unsafe().to_vec();
-    let response = String::from_utf8(received.clone()).expect("Verifier expected received data");
-    response
-        .find("Herman Melville")
-        .unwrap_or_else(|| panic!("Expected valid data from {}", SERVER_DOMAIN));
-    assert_eq!(session_info.server_name.as_str(), SERVER_DOMAIN);
 
     (sent, received, session_info)
 }

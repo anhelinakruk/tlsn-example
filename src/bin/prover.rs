@@ -1,5 +1,6 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
+use clap::Parser;
 use http_body_util::Empty;
 use hyper::{Request, StatusCode, Uri, body::Bytes};
 use macro_rules_attribute::apply;
@@ -13,38 +14,36 @@ use smol_macros::main;
 use tls_core::verify::WebPkiVerifier;
 use tlsn_common::config::ProtocolConfig;
 use tlsn_core::{CryptoProvider, transcript::Idx};
+use tlsn_example::{AppState, args::Args};
 use tlsn_prover::{Prover, ProverConfig, state::Prove};
 use tracing::Level;
 
-const MAX_SENT_DATA: usize = 1 << 12;
-const MAX_RECV_DATA: usize = 1 << 14;
-
-const SECRET: &str = "TLSNotary's private key 🤡";
-const SERVER_DOMAIN: &str = "localhost";
-const SERVER_PORT: u16 = 3001;
-
-const SERVER_ADDR: &str = "127.0.0.1";
-const VERIFIER_ADDR: &str = "127.0.0.1:8079";
-
 #[apply(main!)]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::fmt()
         .with_max_level(Level::DEBUG)
         .init();
 
-    let uri = format!("https://{}:{}/formats/html", SERVER_DOMAIN, SERVER_PORT);
-    let server_ip: IpAddr = SERVER_ADDR.parse().expect("Invalid IP address");
-    let server_addr = SocketAddr::new(server_ip, SERVER_PORT);
+    let args = Args::parse();
+    let app_state = AppState::new(&args)?;
 
-    let verifier_socket = TcpStream::connect(VERIFIER_ADDR).await.unwrap();
+    let uri = format!(
+        "https://{}:{}/api/retail/transaction/6",
+        app_state.server_domain,
+        app_state.server_addr.port()
+    );
 
-    prover(verifier_socket, &server_addr, &uri).await;
+    let verifier_socket = TcpStream::connect(&app_state.verifier_addr).await?;
+
+    prover(verifier_socket, &app_state.server_addr, &uri, &app_state).await;
+    Ok(())
 }
 
 async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     verifier_socket: T,
     server_addr: &SocketAddr,
     uri: &str,
+    app_state: &AppState,
 ) {
     let uri = uri.parse::<Uri>().unwrap();
     println!("URI: {:?}", uri);
@@ -56,7 +55,7 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut root_store = tls_core::anchors::RootCertStore::empty();
     root_store
         .add(&tls_core::key::Certificate(
-            include_bytes!("../../certs/rootCA.der").to_vec(),
+            include_bytes!("../certs/rootCA.der").to_vec(),
         ))
         .unwrap();
     let crypto_provider = CryptoProvider {
@@ -69,8 +68,8 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             .server_name(server_domain)
             .protocol_config(
                 ProtocolConfig::builder()
-                    .max_sent_data(MAX_SENT_DATA)
-                    .max_recv_data(MAX_RECV_DATA)
+                    .max_sent_data(app_state.max_sent_data)
+                    .max_recv_data(app_state.max_recv_data)
                     .build()
                     .unwrap(),
             )
@@ -115,7 +114,7 @@ async fn prover<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         .uri(uri.clone())
         .header("Host", server_domain)
         .header("Connection", "close")
-        .header("Secret", SECRET)
+        .header("Secret", app_state.secret.clone())
         .method("GET")
         .body(Empty::<Bytes>::new())
         .unwrap();
@@ -144,15 +143,7 @@ fn revealed_ranges_received(prover: &mut Prover<Prove>) -> Idx {
     let recv_transcript = prover.transcript().received();
     let recv_transcript_len = recv_transcript.len();
 
-    // Get the received data as a string.
-    let received_string = String::from_utf8(recv_transcript.to_vec()).unwrap();
-    // Find the substring "illustrative".
-    let start = received_string
-        .find("Dick")
-        .expect("Error: The substring 'Dick' was not found in the received data.");
-    let end = start + "Dick".len();
-
-    Idx::new([0..start, end..recv_transcript_len])
+    Idx::new([0..recv_transcript_len])
 }
 
 /// Returns the sent ranges to be revealed to the verifier.
@@ -160,13 +151,6 @@ fn revealed_ranges_sent(prover: &mut Prover<Prove>) -> Idx {
     let sent_transcript = prover.transcript().sent();
     let sent_transcript_len = sent_transcript.len();
 
-    let sent_string = String::from_utf8(sent_transcript.to_vec()).unwrap();
-
-    let secret_start = sent_string.find(SECRET).unwrap();
-
     // Reveal everything except for the SECRET.
-    Idx::new([
-        0..secret_start,
-        secret_start + SECRET.len()..sent_transcript_len,
-    ])
+    Idx::new([0..sent_transcript_len])
 }
